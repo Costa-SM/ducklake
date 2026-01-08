@@ -2,7 +2,6 @@
 #include "storage/ducklake_schema_entry.hpp"
 #include "storage/ducklake_field_data.hpp"
 #include "storage/ducklake_insert.hpp"
-#include "storage/ducklake_low_memory_insert.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "common/ducklake_util.hpp"
@@ -20,6 +19,8 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/main/client_config.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 
@@ -746,13 +747,13 @@ PhysicalOperator &DuckLakeInsert::PlanInsert(ClientContext &context, PhysicalPla
 }
 
 //===--------------------------------------------------------------------===//
-// Low Memory Insert (Radix Hierarchical Strategy)
+// Low Memory Insert
 //===--------------------------------------------------------------------===//
 bool DuckLakeInsert::IsLowMemoryInsertEnabled(ClientContext &context, DuckLakeTableEntry &table) {
 	auto &catalog = table.ParentCatalog().Cast<DuckLakeCatalog>();
 	auto &schema = table.ParentSchema().Cast<DuckLakeSchemaEntry>();
 
-	// Check if low_memory_insert option is enabled
+	// Check if low_memory_insert option is enabled for this table
 	string low_memory_value;
 	bool low_memory_enabled = catalog.TryGetConfigOption("low_memory_insert", low_memory_value,
 	                                                      schema.GetSchemaId(), table.GetTableId()) &&
@@ -802,27 +803,22 @@ PhysicalOperator &DuckLakeCatalog::PlanInsert(ClientContext &context, PhysicalPl
 
 	DuckLakeCopyInput copy_input(context, ducklake_table);
 
-	if (use_low_memory && copy_input.partition_data) {
-		// Use the low memory insert operator for partitioned tables
-		// This processes partitions in batches to avoid OOM with high-cardinality partitioning
-
-		// Find the partition column index
-		// For bucket partitioning, this is typically the computed bucket value column
-		idx_t partition_column_idx = 0;  // TODO: Get actual partition column index from copy_input
-
-		// Estimate partition count (for bucket partitioning, this comes from the bucket count)
-		idx_t estimated_partition_count = RadixInsertConfig::NUM_SUPER_PARTITIONS;  // Default estimate
-
-		auto &low_memory_insert = planner.Make<DuckLakeLowMemoryInsert>(
-		    op.types, ducklake_table, partition_column_idx,
-		    std::move(copy_input.encryption_key), estimated_partition_count);
-
-		if (inline_data) {
-			// Note: DuckLakeLowMemoryInsert doesn't support inline_data yet
-			// inline_data->insert = low_memory_insert.Cast<DuckLakeLowMemoryInsert>();
-		}
-		low_memory_insert.children.push_back(*plan);
-		return low_memory_insert;
+	if (use_low_memory && copy_input.partition_data && !copy_input.partition_data->fields.empty()) {
+		// Low memory insert mode: configure DuckDB's partitioned write settings
+		// to use less memory by flushing more frequently and limiting open files.
+		//
+		// These settings are read by PhysicalCopyToFile in its local/global state:
+		// - partitioned_write_flush_threshold: rows buffered before flushing partitions
+		// - partitioned_write_max_open_files: max concurrent partition writers
+		//
+		// Setting these to lower values reduces memory at the cost of more I/O.
+		auto &config = DBConfig::GetConfig(context);
+		
+		// Flush partitions after 10K rows instead of default (much higher)
+		config.SetOptionByName("partitioned_write_flush_threshold", Value::UBIGINT(10000));
+		
+		// Limit to 64 open files instead of default (usually much higher)
+		config.SetOptionByName("partitioned_write_max_open_files", Value::UBIGINT(64));
 	}
 
 	// Standard insert path

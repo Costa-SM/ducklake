@@ -18,26 +18,6 @@
 
 namespace duckdb {
 
-//===--------------------------------------------------------------------===//
-// Radix Hierarchical Insert Configuration
-//===--------------------------------------------------------------------===//
-// Used for low-memory high-cardinality partitioned inserts.
-// When enabled via 'low_memory_insert' option, inserts will use a strategy
-// that processes partitions in groups (super-partitions) to reduce memory usage.
-struct RadixInsertConfig {
-	//! Number of bits for super-partitioning (8 = 256 super-partitions)
-	static constexpr idx_t RADIX_BITS = 8;
-	//! Number of super-partitions (2^RADIX_BITS)
-	static constexpr idx_t NUM_SUPER_PARTITIONS = 1 << RADIX_BITS;
-
-	static idx_t GetSuperPartitionCount(idx_t partition_count) {
-		return MinValue<idx_t>(NUM_SUPER_PARTITIONS, partition_count);
-	}
-
-	static idx_t GetPartitionsPerSuperPartition(idx_t partition_count, idx_t num_super_partitions) {
-		return (partition_count + num_super_partitions - 1) / num_super_partitions;
-	}
-};
 class DuckLakeCatalog;
 class DuckLakeSchemaEntry;
 class DuckLakeTableEntry;

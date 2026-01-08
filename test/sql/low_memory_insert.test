@@ -1,0 +1,122 @@
+# name: test/sql/low_memory_insert.test
+# description: Test low memory insert option for partitioned tables
+# group: [partitioning]
+#
+# The low_memory_insert option reduces memory usage during partitioned writes by:
+# - Setting partitioned_write_flush_threshold to 10K rows (flush partitions frequently)
+# - Setting partitioned_write_max_open_files to 64 (limit concurrent writers)
+#
+# This trades some I/O overhead for significantly lower memory usage,
+# which helps when inserting into tables with many partitions.
+
+require ducklake
+
+require parquet
+
+# Create a test catalog with in-memory metadata
+statement ok
+ATTACH ':memory:' AS ducklake_test (TYPE ducklake, DATA_PATH '__TEST_DIR__/low_memory_insert_test');
+
+statement ok
+USE ducklake_test;
+
+# Test: Standard insert works with partitioned tables
+statement ok
+CREATE TABLE test_partitioned (
+    id INTEGER,
+    user_id VARCHAR,
+    value DOUBLE
+);
+
+statement ok
+ALTER TABLE test_partitioned SET PARTITIONED BY (user_id);
+
+# Insert without low_memory_insert option (standard path)
+statement ok
+INSERT INTO test_partitioned VALUES (1, 'user_a', 10.0);
+
+query III
+SELECT * FROM test_partitioned;
+----
+1	user_a	10.0
+
+# Test: set_option for low_memory_insert enables memory-efficient mode
+statement ok
+CALL ducklake_test.set_option('low_memory_insert', true);
+
+# Insert with low_memory_insert enabled - uses aggressive flush/open file settings
+statement ok
+INSERT INTO test_partitioned VALUES (2, 'user_b', 20.0);
+
+query III rowsort
+SELECT * FROM test_partitioned;
+----
+1	user_a	10.0
+2	user_b	20.0
+
+# Test: Multiple rows
+statement ok
+INSERT INTO test_partitioned VALUES 
+    (3, 'user_a', 30.0),
+    (4, 'user_c', 40.0),
+    (5, 'user_b', 50.0);
+
+query I
+SELECT COUNT(*) FROM test_partitioned;
+----
+5
+
+# Verify partitioning works correctly
+query II rowsort
+SELECT user_id, COUNT(*) FROM test_partitioned GROUP BY user_id;
+----
+user_a	2
+user_b	2
+user_c	1
+
+# Disable low_memory_insert
+statement ok
+CALL ducklake_test.set_option('low_memory_insert', false);
+
+# Insert more data
+statement ok
+INSERT INTO test_partitioned VALUES (6, 'user_d', 60.0);
+
+query I
+SELECT COUNT(*) FROM test_partitioned;
+----
+6
+
+# Test with integer partition column
+statement ok
+CREATE TABLE test_int_partition (
+    id INTEGER,
+    category INTEGER,
+    amount DECIMAL(10,2)
+);
+
+statement ok
+ALTER TABLE test_int_partition SET PARTITIONED BY (category);
+
+statement ok
+CALL ducklake_test.set_option('low_memory_insert', true);
+
+statement ok
+INSERT INTO test_int_partition VALUES
+    (1, 100, 99.99),
+    (2, 200, 199.99),
+    (3, 100, 49.99);
+
+query III rowsort
+SELECT * FROM test_int_partition;
+----
+1	100	99.99
+2	200	199.99
+3	100	49.99
+
+# Cleanup
+statement ok
+DROP TABLE test_partitioned;
+
+statement ok
+DROP TABLE test_int_partition;
