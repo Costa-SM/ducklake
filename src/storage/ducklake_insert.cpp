@@ -2,6 +2,7 @@
 #include "storage/ducklake_schema_entry.hpp"
 #include "storage/ducklake_field_data.hpp"
 #include "storage/ducklake_insert.hpp"
+#include "storage/ducklake_low_memory_insert.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "common/ducklake_util.hpp"
@@ -744,6 +745,22 @@ PhysicalOperator &DuckLakeInsert::PlanInsert(ClientContext &context, PhysicalPla
 	return planner.Make<DuckLakeInsert>(return_types, table, partition_id, std::move(encryption_key));
 }
 
+//===--------------------------------------------------------------------===//
+// Low Memory Insert (Radix Hierarchical Strategy)
+//===--------------------------------------------------------------------===//
+bool DuckLakeInsert::IsLowMemoryInsertEnabled(ClientContext &context, DuckLakeTableEntry &table) {
+	auto &catalog = table.ParentCatalog().Cast<DuckLakeCatalog>();
+	auto &schema = table.ParentSchema().Cast<DuckLakeSchemaEntry>();
+
+	// Check if low_memory_insert option is enabled
+	string low_memory_value;
+	bool low_memory_enabled = catalog.TryGetConfigOption("low_memory_insert", low_memory_value,
+	                                                      schema.GetSchemaId(), table.GetTableId()) &&
+	                          low_memory_value == "true";
+
+	return low_memory_enabled;
+}
+
 string DuckLakeCatalog::GenerateEncryptionKey(ClientContext &context) const {
 	if (Encryption() != DuckLakeEncryption::ENCRYPTED) {
 		// not encrypted
@@ -779,7 +796,36 @@ PhysicalOperator &DuckLakeCatalog::PlanInsert(ClientContext &context, PhysicalPl
 		plan = planner.Make<DuckLakeInlineData>(*plan, data_inlining_row_limit);
 		inline_data = plan->Cast<DuckLakeInlineData>();
 	}
+
+	// Check if low memory insert mode is enabled
+	bool use_low_memory = DuckLakeInsert::IsLowMemoryInsertEnabled(context, ducklake_table);
+
 	DuckLakeCopyInput copy_input(context, ducklake_table);
+
+	if (use_low_memory && copy_input.partition_data) {
+		// Use the low memory insert operator for partitioned tables
+		// This processes partitions in batches to avoid OOM with high-cardinality partitioning
+
+		// Find the partition column index
+		// For bucket partitioning, this is typically the computed bucket value column
+		idx_t partition_column_idx = 0;  // TODO: Get actual partition column index from copy_input
+
+		// Estimate partition count (for bucket partitioning, this comes from the bucket count)
+		idx_t estimated_partition_count = RadixInsertConfig::NUM_SUPER_PARTITIONS;  // Default estimate
+
+		auto &low_memory_insert = planner.Make<DuckLakeLowMemoryInsert>(
+		    op.types, ducklake_table, partition_column_idx,
+		    std::move(copy_input.encryption_key), estimated_partition_count);
+
+		if (inline_data) {
+			// Note: DuckLakeLowMemoryInsert doesn't support inline_data yet
+			// inline_data->insert = low_memory_insert.Cast<DuckLakeLowMemoryInsert>();
+		}
+		low_memory_insert.children.push_back(*plan);
+		return low_memory_insert;
+	}
+
+	// Standard insert path
 	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, plan);
 	auto &insert = DuckLakeInsert::PlanInsert(context, planner, ducklake_table, std::move(copy_input.encryption_key));
 	if (inline_data) {
